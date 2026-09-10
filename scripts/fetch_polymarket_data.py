@@ -80,17 +80,27 @@ def fetch_closed_markets(n_markets: int, min_end_date: str, batch_size: int = 10
     markets = []
     offset = 0
     while len(markets) < n_markets:
-        page = _get_json(
-            GAMMA_URL,
-            {
-                "closed": "true",
-                "end_date_min": min_end_date,
-                "order": "volume",
-                "ascending": "false",
-                "limit": min(batch_size, n_markets - len(markets)),
-                "offset": offset,
-            },
-        )
+        try:
+            page = _get_json(
+                GAMMA_URL,
+                {
+                    "closed": "true",
+                    "end_date_min": min_end_date,
+                    "order": "volume",
+                    "ascending": "false",
+                    "limit": min(batch_size, n_markets - len(markets)),
+                    "offset": offset,
+                },
+            )
+        except RuntimeError as e:
+            if "offset too large" in str(e):
+                print(
+                    f"  Gamma API's offset pagination caps out at offset={offset} "
+                    f"-- stopping with {len(markets)} markets instead of the requested {n_markets}.",
+                    file=sys.stderr,
+                )
+                break
+            raise
         if not page:
             break
         markets.extend(page)
