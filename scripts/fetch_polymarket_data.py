@@ -67,13 +67,29 @@ def _get_json(url: str, params: dict, retries: int = 3, timeout: int = 20):
     raise RuntimeError(f"failed to fetch {full_url}: {last_err}")
 
 
-def fetch_closed_markets(n_markets: int, batch_size: int = 100):
+def fetch_closed_markets(n_markets: int, min_end_date: str, batch_size: int = 100):
+    """Fetches recently-closed, volume-ordered markets.
+
+    Polymarket's central limit order book (the source of the CLOB
+    prices-history endpoint) didn't exist for its earliest 2020/2021
+    markets, so the default (oldest-first) listing returns markets with
+    resolved outcomes but no price history at all. Filtering to recent
+    markets and ordering by volume avoids both that and thinly-traded
+    markets with sparse or degenerate (e.g. "0","0") outcome data.
+    """
     markets = []
     offset = 0
     while len(markets) < n_markets:
         page = _get_json(
             GAMMA_URL,
-            {"closed": "true", "limit": min(batch_size, n_markets - len(markets)), "offset": offset},
+            {
+                "closed": "true",
+                "end_date_min": min_end_date,
+                "order": "volume",
+                "ascending": "false",
+                "limit": min(batch_size, n_markets - len(markets)),
+                "offset": offset,
+            },
         )
         if not page:
             break
@@ -141,10 +157,21 @@ def main() -> None:
     parser.add_argument("--n-markets", type=int, default=300)
     parser.add_argument("--samples-per-market", type=int, default=20)
     parser.add_argument("--fidelity-minutes", type=int, default=60)
+    parser.add_argument(
+        "--min-end-date",
+        default=(datetime.date.today() - datetime.timedelta(days=730)).isoformat(),
+        help="only fetch markets that closed after this date (YYYY-MM-DD) -- "
+        "defaults to 2 years ago, since Polymarket's CLOB (and its price "
+        "history) postdates its earliest markets",
+    )
     args = parser.parse_args()
 
-    print(f"Fetching up to {args.n_markets} closed markets from Gamma API...", file=sys.stderr)
-    markets = fetch_closed_markets(args.n_markets)
+    print(
+        f"Fetching up to {args.n_markets} closed markets from Gamma API "
+        f"(closed after {args.min_end_date}, most-traded first)...",
+        file=sys.stderr,
+    )
+    markets = fetch_closed_markets(args.n_markets, args.min_end_date)
     print(f"Got {len(markets)} closed markets.", file=sys.stderr)
 
     rows_written = 0
