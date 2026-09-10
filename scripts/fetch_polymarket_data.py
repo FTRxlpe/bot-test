@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import sys
 import time
@@ -29,6 +30,19 @@ import urllib.request
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_HISTORY_URL = "https://clob.polymarket.com/prices-history"
+
+MAX_WINDOW_SECONDS = 30 * 86400  # the CLOB API rejects startTs/endTs spans
+                                  # that are "too long"; 30 days of hourly
+                                  # candles (720 points) stays well under it
+
+
+def _parse_iso_ts(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
 
 
 def _get_json(url: str, params: dict, retries: int = 3, timeout: int = 20):
@@ -93,14 +107,28 @@ def resolved_outcome_for_first_token(market: dict) -> tuple[str, int] | None:
     return None  # not cleanly resolved (e.g. still ambiguous) -- skip
 
 
-def fetch_price_history(token_id: str, fidelity_minutes: int = 60):
-    # startTs=0 asks for the token's full history; some CLOB deployments
-    # default to a short recent window if startTs/endTs are omitted.
+def fetch_price_history(token_id: str, start_ts: int, end_ts: int, fidelity_minutes: int = 60):
     data = _get_json(
         CLOB_HISTORY_URL,
-        {"market": token_id, "fidelity": fidelity_minutes, "startTs": 0, "endTs": int(time.time())},
+        {"market": token_id, "fidelity": fidelity_minutes, "startTs": start_ts, "endTs": end_ts},
     )
     return data.get("history", [])
+
+
+def market_window(market: dict) -> tuple[int, int]:
+    """Returns (start_ts, end_ts) clipped to at most MAX_WINDOW_SECONDS,
+    anchored on the market's actual close time so we sample its real
+    price history rather than an arbitrary recent window.
+    """
+    end_ts = (
+        _parse_iso_ts(market.get("closedTime"))
+        or _parse_iso_ts(market.get("endDate"))
+        or int(time.time())
+    )
+    start_ts = _parse_iso_ts(market.get("startDate")) or _parse_iso_ts(market.get("createdAt"))
+    if start_ts is None or end_ts - start_ts > MAX_WINDOW_SECONDS:
+        start_ts = end_ts - MAX_WINDOW_SECONDS
+    return start_ts, end_ts
 
 
 def main() -> None:
@@ -126,9 +154,10 @@ def main() -> None:
                 continue
             token_id, outcome = resolved
             market_id = market.get("conditionId", market.get("id", f"market-{i}"))
+            start_ts, end_ts = market_window(market)
 
             try:
-                history = fetch_price_history(token_id, args.fidelity_minutes)
+                history = fetch_price_history(token_id, start_ts, end_ts, args.fidelity_minutes)
             except RuntimeError as e:
                 print(f"  skip {market_id}: {e}", file=sys.stderr)
                 continue
