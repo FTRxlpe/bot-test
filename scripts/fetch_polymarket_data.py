@@ -31,9 +31,10 @@ import urllib.request
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 
-MAX_WINDOW_SECONDS = 30 * 86400  # the CLOB API rejects startTs/endTs spans
-                                  # that are "too long"; 30 days of hourly
-                                  # candles (720 points) stays well under it
+MAX_WINDOW_SECONDS = 14 * 86400  # the CLOB API rejects startTs/endTs spans
+                                  # that are "too long" -- 30 days already
+                                  # tripped it empirically, so stay well
+                                  # under with 14 days of hourly candles
 
 
 def _parse_iso_ts(value: str | None) -> int | None:
@@ -126,7 +127,10 @@ def market_window(market: dict) -> tuple[int, int]:
         or int(time.time())
     )
     start_ts = _parse_iso_ts(market.get("startDate")) or _parse_iso_ts(market.get("createdAt"))
-    if start_ts is None or end_ts - start_ts > MAX_WINDOW_SECONDS:
+    # Some markets carry inconsistent/templated date fields (e.g. a reused
+    # startDate from a recurring series) where startDate ends up AFTER
+    # closedTime. Guard against that as well as an overly long window.
+    if start_ts is None or start_ts >= end_ts or end_ts - start_ts > MAX_WINDOW_SECONDS:
         start_ts = end_ts - MAX_WINDOW_SECONDS
     return start_ts, end_ts
 
