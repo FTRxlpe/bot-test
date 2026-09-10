@@ -148,6 +148,9 @@ def main() -> None:
     print(f"Got {len(markets)} closed markets.", file=sys.stderr)
 
     rows_written = 0
+    n_unresolved = 0
+    n_empty_history = 0
+    n_fetch_errors = 0
     with open(args.out, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["price", "outcome", "market_id"])
@@ -155,6 +158,13 @@ def main() -> None:
         for i, market in enumerate(markets):
             resolved = resolved_outcome_for_first_token(market)
             if resolved is None:
+                n_unresolved += 1
+                if n_unresolved <= 2:
+                    print(
+                        f"  unresolved sample: outcomePrices={market.get('outcomePrices')!r} "
+                        f"clobTokenIds={market.get('clobTokenIds')!r}",
+                        file=sys.stderr,
+                    )
                 continue
             token_id, outcome = resolved
             market_id = market.get("conditionId", market.get("id", f"market-{i}"))
@@ -163,10 +173,14 @@ def main() -> None:
             try:
                 history = fetch_price_history(token_id, start_ts, end_ts, args.fidelity_minutes)
             except RuntimeError as e:
+                n_fetch_errors += 1
                 print(f"  skip {market_id}: {e}", file=sys.stderr)
                 continue
 
             if not history:
+                n_empty_history += 1
+                if n_empty_history <= 2:
+                    print(f"  empty history for {market_id} (token {token_id}), window=[{start_ts},{end_ts}]", file=sys.stderr)
                 continue
 
             # Sample evenly across this token's price history, paired with
@@ -184,11 +198,16 @@ def main() -> None:
                 print(f"  processed {i + 1}/{len(markets)} markets, {rows_written} rows so far", file=sys.stderr)
             time.sleep(0.1)  # be polite to the public API
 
-    print(f"Wrote {rows_written} rows to {args.out}", file=sys.stderr)
+    print(
+        f"Wrote {rows_written} rows to {args.out} "
+        f"(unresolved={n_unresolved} empty_history={n_empty_history} fetch_errors={n_fetch_errors} "
+        f"out of {len(markets)} markets)",
+        file=sys.stderr,
+    )
     if rows_written == 0:
         print(
-            "No rows written -- check network access to gamma-api.polymarket.com "
-            "and clob.polymarket.com from this environment.",
+            "No rows written -- see the unresolved/empty_history counts above "
+            "for which stage is filtering everything out.",
             file=sys.stderr,
         )
 
