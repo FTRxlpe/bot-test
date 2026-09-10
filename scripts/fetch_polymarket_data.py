@@ -40,8 +40,14 @@ def _get_json(url: str, params: dict, retries: int = 3, timeout: int = 20):
             req = urllib.request.Request(full_url, headers={"User-Agent": "bot-test-research/1.0"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            last_err = f"HTTP {e.code}: {body}"
+            if e.code < 500:
+                break  # a 4xx won't fix itself on retry -- fail fast with the body
+            time.sleep(1.5 * (attempt + 1))
         except (urllib.error.URLError, TimeoutError) as e:
-            last_err = e
+            last_err = str(e)
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"failed to fetch {full_url}: {last_err}")
 
