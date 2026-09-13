@@ -14,6 +14,7 @@ from .data import Trade
 from .ev import expected_value
 from .kelly import kelly_fraction
 from .pricing import PriceBucket, calibration_curve, mispricing
+from .risk_manager import RiskLimits, RiskManager
 from .strategy import StrategyConfig
 
 
@@ -74,7 +75,7 @@ def run_backtest(
 ) -> BacktestReport:
     config = config or StrategyConfig()
 
-    ordered = sorted(trades, key=lambda t: t.index)
+    ordered = sorted(trades, key=lambda t: (t.timestamp if t.timestamp else t.index, t.index))
     cut = int(len(ordered) * train_frac)
     train, test = ordered[:cut], ordered[cut:]
     if not train or not test:
@@ -160,4 +161,219 @@ def run_backtest(
         max_drawdown=max_drawdown,
         avg_return_per_trade=avg_return_per_trade,
         trades=results,
+    )
+
+
+@dataclass
+class FoldReport:
+    fold_index: int
+    train_size: int
+    test_size: int
+    n_candidates: int
+    n_taken: int
+    n_wins: int
+    n_losses: int
+    n_skipped_by_risk_manager: int
+
+
+@dataclass
+class WalkForwardReport:
+    """Multi-fold walk-forward result: fold 1 trains on chunk 0 and tests on
+    chunk 1, fold 2 trains on chunks 0-1 and tests on chunk 2, etc. (expanding
+    window). Every fold's calibration curve is fit ONLY on trades chronologically
+    before that fold's test chunk -- no fold ever sees its own test data, or any
+    future data, while fitting. Bankroll, drawdown, and risk-manager state
+    (loss streaks, cooldowns, daily caps) all carry forward continuously across
+    fold boundaries, exactly as they would in live sequential trading.
+    """
+
+    folds: list[FoldReport]
+    n_candidates: int
+    n_taken: int
+    n_wins: int
+    n_losses: int
+    win_rate: float
+    total_pnl: float
+    starting_bankroll: float
+    ending_bankroll: float
+    roi: float
+    max_drawdown: float
+    avg_return_per_trade: float
+    n_skipped_by_risk_manager: int
+    trades: list[TradeResult]
+
+    def summary(self) -> str:
+        return (
+            f"[walk-forward, {len(self.folds)} folds] "
+            f"candidates={self.n_candidates} taken={self.n_taken} "
+            f"wins={self.n_wins} losses={self.n_losses} "
+            f"win_rate={self.win_rate:.2%} "
+            f"avg_return_per_trade={self.avg_return_per_trade:.2%} "
+            f"total_pnl=${self.total_pnl:.2f} roi={self.roi:.2%} "
+            f"max_drawdown={self.max_drawdown:.2%} "
+            f"skipped_by_risk_manager={self.n_skipped_by_risk_manager} "
+            f"ending_bankroll=${self.ending_bankroll:.2f}"
+        )
+
+
+def _day_key_for(t: Trade, trades_per_day: int) -> int:
+    if t.timestamp:
+        return int(t.timestamp // 86400)
+    return t.index // max(1, trades_per_day)
+
+
+def run_walk_forward_backtest(
+    trades: list[Trade],
+    config: StrategyConfig | None = None,
+    risk_limits: RiskLimits | None = None,
+    n_folds: int = 5,
+    starting_bankroll: float = 100.0,
+    bucket_width: float = 0.05,
+    min_trades_per_bucket: int = 30,
+    trades_per_day: int = 50,
+) -> WalkForwardReport:
+    """Walk-forward backtest with an expanding training window and a live
+    risk manager applied sequentially across the whole test period.
+
+    Unlike `run_backtest` (a single train/test split), this fits a fresh
+    calibration curve before EACH fold using only the trades chronologically
+    preceding it, so the reported edge cannot come from a calibration curve
+    that "saw the future" relative to any test trade -- including trades in
+    later folds, which still only ever get a curve fit on data strictly
+    before them.
+    """
+    config = config or StrategyConfig()
+    risk_limits = risk_limits or RiskLimits()
+    if n_folds < 1:
+        raise ValueError("n_folds must be >= 1")
+
+    ordered = sorted(trades, key=lambda t: (t.timestamp if t.timestamp else t.index, t.index))
+    n = len(ordered)
+    n_chunks = n_folds + 1  # 1 seed chunk (train-only) + n_folds test chunks
+    if n < n_chunks:
+        raise ValueError("not enough trades for the requested number of folds")
+
+    chunk_size = n // n_chunks
+    chunks = [ordered[i * chunk_size : (i + 1) * chunk_size] for i in range(n_chunks - 1)]
+    chunks.append(ordered[(n_chunks - 1) * chunk_size :])  # last chunk absorbs the remainder
+
+    risk_manager = RiskManager(risk_limits, starting_bankroll)
+    bankroll = starting_bankroll
+    peak = starting_bankroll
+    max_drawdown = 0.0
+    all_results: list[TradeResult] = []
+    fold_reports: list[FoldReport] = []
+    total_candidates = 0
+    total_skipped_by_risk = 0
+
+    train_chunks: list[Trade] = list(chunks[0])
+    for fold_index, test_chunk in enumerate(chunks[1:], start=1):
+        buckets = calibration_curve(
+            [t.price for t in train_chunks],
+            [t.outcome for t in train_chunks],
+            bucket_width=bucket_width,
+            min_trades_per_bucket=min_trades_per_bucket,
+        )
+
+        fold_candidates = 0
+        fold_taken = 0
+        fold_wins = 0
+        fold_skipped = 0
+
+        for t in test_chunk:
+            if not (config.min_price <= t.price <= config.max_price):
+                continue
+            fold_candidates += 1
+            total_candidates += 1
+
+            day_key = _day_key_for(t, trades_per_day)
+            decision = risk_manager.check(day_key)
+            if not decision.allowed:
+                fold_skipped += 1
+                total_skipped_by_risk += 1
+                risk_manager.record_skip_during_cooldown()
+                continue
+
+            bucket = _bucket_for_price(buckets, t.price)
+            if bucket is None:
+                continue
+
+            calibrated_p = bucket.actual_win_rate
+            delta = mispricing(calibrated_p, t.price)
+            ev = expected_value(calibrated_p, t.price) - config.fee_rate
+            if not (delta >= config.min_delta and ev > 0):
+                continue
+
+            size_frac = kelly_fraction(calibrated_p, t.price, fraction=config.kelly_fraction_cap)
+            if size_frac <= 0:
+                continue
+
+            desired_stake = bankroll * size_frac
+            stake = risk_manager.cap_stake(desired_stake)
+            stake = max(0.0, min(stake, bankroll))
+            if stake <= 0:
+                continue
+
+            shares = stake / t.price
+            pnl = shares * (1.0 - t.price) if t.outcome == 1 else -stake
+
+            bankroll += pnl
+            peak = max(peak, bankroll)
+            if peak > 0:
+                max_drawdown = max(max_drawdown, (peak - bankroll) / peak)
+
+            risk_manager.record_result(day_key, pnl)
+
+            fold_taken += 1
+            if t.outcome == 1:
+                fold_wins += 1
+
+            all_results.append(
+                TradeResult(
+                    price=t.price,
+                    outcome=t.outcome,
+                    calibrated_win_probability=calibrated_p,
+                    delta=delta,
+                    ev=ev,
+                    stake=stake,
+                    pnl=pnl,
+                )
+            )
+
+        fold_reports.append(
+            FoldReport(
+                fold_index=fold_index,
+                train_size=len(train_chunks),
+                test_size=len(test_chunk),
+                n_candidates=fold_candidates,
+                n_taken=fold_taken,
+                n_wins=fold_wins,
+                n_losses=fold_taken - fold_wins,
+                n_skipped_by_risk_manager=fold_skipped,
+            )
+        )
+        train_chunks = train_chunks + list(test_chunk)  # expand the window for the next fold
+
+    n_wins = sum(1 for r in all_results if r.outcome == 1)
+    n_losses = len(all_results) - n_wins
+    total_pnl = bankroll - starting_bankroll
+    avg_return_per_trade = (
+        sum(r.pnl / r.stake for r in all_results) / len(all_results) if all_results else 0.0
+    )
+
+    return WalkForwardReport(
+        folds=fold_reports,
+        n_candidates=total_candidates,
+        n_taken=len(all_results),
+        n_wins=n_wins,
+        n_losses=n_losses,
+        win_rate=(n_wins / len(all_results)) if all_results else 0.0,
+        total_pnl=total_pnl,
+        starting_bankroll=starting_bankroll,
+        ending_bankroll=bankroll,
+        roi=(total_pnl / starting_bankroll) if starting_bankroll else 0.0,
+        max_drawdown=max_drawdown,
+        avg_return_per_trade=avg_return_per_trade,
+        n_skipped_by_risk_manager=total_skipped_by_risk,
+        trades=all_results,
     )

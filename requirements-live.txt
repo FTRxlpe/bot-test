@@ -1,0 +1,4 @@
+# Only needed for `python -m polymarket_strategy.cli live` (real order placement).
+# Paper trading, backtesting, walk-forward, and the full test suite need NONE of this --
+# kept separate so `pip install -r requirements.txt` stays dependency-light.
+py-clob-client>=0.20
