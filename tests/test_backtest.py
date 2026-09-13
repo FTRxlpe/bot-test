@@ -2,8 +2,8 @@ import random
 
 import pytest
 
-from polymarket_strategy.backtest import run_backtest, run_walk_forward_backtest
-from polymarket_strategy.data import Trade, generate_synthetic_trades
+from polymarket_strategy.backtest import run_backtest, run_last_n_days_backtest, run_walk_forward_backtest
+from polymarket_strategy.data import Trade, generate_synthetic_trades, generate_synthetic_trades_with_timestamps
 from polymarket_strategy.risk_manager import RiskLimits
 from polymarket_strategy.strategy import StrategyConfig
 
@@ -127,3 +127,64 @@ def test_walk_forward_rejects_too_few_trades_for_requested_folds():
     trades = [Trade(price=0.9, outcome=1, index=i) for i in range(5)]
     with pytest.raises(ValueError):
         run_walk_forward_backtest(trades, n_folds=5)
+
+
+def test_last_n_days_backtest_only_trades_the_recent_window():
+    # 90 days of history; ask for the last 30 -- the test period must be
+    # exactly the tail, and calibration must come only from the other 60.
+    trades = generate_synthetic_trades_with_timestamps(
+        n=30000, days=90, favorite_longshot_bias=0.06, seed=5, end_time=1_000_000_000.0
+    )
+    config = StrategyConfig(min_delta=0.02, min_price=0.80, max_price=0.99, kelly_fraction_cap=0.25)
+    report = run_last_n_days_backtest(
+        trades, n_days=30, config=config, starting_bankroll=200.0, reference_time=1_000_000_000.0
+    )
+
+    cutoff = 1_000_000_000.0 - 30 * 86400
+    expected_test_size = sum(1 for t in trades if cutoff <= t.timestamp <= 1_000_000_000.0)
+    expected_train_size = sum(1 for t in trades if t.timestamp < cutoff)
+
+    assert report.n_days == 30
+    assert report.starting_bankroll == 200.0
+    assert report.test_size == expected_test_size
+    assert report.train_size == expected_train_size
+    assert report.n_taken > 0, "a real injected bias should still produce trades in a 30-day window"
+    assert 0.70 < report.win_rate < 0.99
+
+
+def test_last_n_days_backtest_zero_trades_with_exactly_calibrated_market():
+    base_trades = _exactly_calibrated_trades(n_repeats=100)
+    # Stamp with real timestamps spread over 90 days so the 30-day window applies.
+    end_time = 1_000_000_000.0
+    start_time = end_time - 90 * 86400
+    span = end_time - start_time
+    n = len(base_trades)
+    trades = [
+        Trade(price=t.price, outcome=t.outcome, index=t.index, timestamp=start_time + span * (t.index / n))
+        for t in base_trades
+    ]
+    config = StrategyConfig(min_delta=0.02, min_price=0.80, max_price=0.99)
+    report = run_last_n_days_backtest(
+        trades, n_days=30, config=config, starting_bankroll=200.0, reference_time=end_time
+    )
+
+    assert report.n_candidates > 0
+    assert report.n_taken == 0
+    assert report.ending_bankroll == report.starting_bankroll
+
+
+def test_last_n_days_backtest_rejects_trades_without_timestamps():
+    trades = generate_synthetic_trades(n=1000, seed=1)  # no real timestamps
+    with pytest.raises(ValueError, match="real timestamp"):
+        run_last_n_days_backtest(trades, n_days=30)
+
+
+def test_last_n_days_backtest_rejects_no_history_before_cutoff():
+    # All trades fall inside the test window -- nothing to calibrate on.
+    end_time = 1_000_000_000.0
+    trades = [
+        Trade(price=0.9, outcome=1, index=i, timestamp=end_time - i * 60)
+        for i in range(100)
+    ]
+    with pytest.raises(ValueError, match="no trade history before"):
+        run_last_n_days_backtest(trades, n_days=30, reference_time=end_time)

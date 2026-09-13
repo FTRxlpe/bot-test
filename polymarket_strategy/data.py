@@ -74,3 +74,40 @@ def generate_synthetic_trades(
         outcome = 1 if rng.random() < true_p else 0
         trades.append(Trade(price=price, outcome=outcome, market_id=f"synthetic-{i}", index=i))
     return trades
+
+
+def generate_synthetic_trades_with_timestamps(
+    n: int = 20000,
+    days: int = 120,
+    favorite_longshot_bias: float = 0.05,
+    seed: int = 42,
+    end_time: float | None = None,
+) -> list[Trade]:
+    """Same generative model as generate_synthetic_trades, but with each
+    trade also assigned a real timestamp spread evenly over the last `days`
+    days (ending at `end_time`, or now if not given). Needed to exercise
+    run_last_n_days_backtest, which requires real timestamps -- it has no
+    concept of a "day" for index-only synthetic data.
+
+    Labeled, illustrative data only -- NOT a claim about real Polymarket
+    activity or trade volume.
+    """
+    import time as _time
+
+    rng = random.Random(seed)
+    end_time = end_time if end_time is not None else _time.time()
+    start_time = end_time - days * 86400
+    trades = []
+    for i in range(n):
+        price = rng.uniform(0.01, 0.99)
+        if price > 0.5:
+            bias = favorite_longshot_bias * ((price - 0.5) / 0.5)
+        else:
+            bias = 0.0
+        true_p = min(0.999, price + bias)
+        outcome = 1 if rng.random() < true_p else 0
+        timestamp = start_time + rng.uniform(0.0, 1.0) * (end_time - start_time)
+        trades.append(
+            Trade(price=price, outcome=outcome, market_id=f"synthetic-{i}", index=i, timestamp=timestamp)
+        )
+    return trades

@@ -82,7 +82,7 @@ pitch describes (configurable).
 
 ## Walk-forward backtest — no future information leaks into a decision
 
-`polymarket_strategy/backtest.py` has two engines:
+`polymarket_strategy/backtest.py` has three engines:
 
 - `run_backtest`: a single chronological train/test split (fit calibration
   on the first half, trade the second half).
@@ -94,6 +94,13 @@ pitch describes (configurable).
   from the future, while fitting. Bankroll, drawdown, and risk-manager state
   (loss streaks, cooldowns, daily caps) carry forward continuously across
   fold boundaries, exactly as they would in live sequential trading.
+- `run_last_n_days_backtest`: answers "if I'd started trading N days ago
+  with $X, what would have happened?" — calibration is fit exclusively on
+  trade history strictly before the N-day cutoff, then the strategy trades
+  only that recent window. Requires real timestamps (a calendar-time
+  question is meaningless on index-only/synthetic ordering, so it raises
+  rather than guessing). CLI: `polymarket_strategy.cli recent --csv
+  your_trades.csv --n-days 30 --starting-bankroll 200`.
 
 Fitting and evaluating a calibration curve on the same data is a classic
 backtest bug — it lets an "edge" be sampling noise the model memorized. Every
@@ -194,13 +201,15 @@ environment with normal internet access.
 
 ```bash
 pip install -r requirements.txt
-pytest                                          # 48 tests: formula correctness, walk-forward
+pytest                                          # 52 tests: formula correctness, walk-forward
                                                  # bias-detection + zero-trade control, risk
-                                                 # manager, live-trading gating, live-loop logic
+                                                 # manager, live-trading gating, live-loop logic,
+                                                 # last-N-days windowing
 
 python -m polymarket_strategy.cli backtest      # single-split, synthetic demo data
 python -m polymarket_strategy.cli walk-forward  # walk-forward + risk manager, synthetic demo data
 python -m polymarket_strategy.cli walk-forward --csv your_trades.csv --n-folds 5
+python -m polymarket_strategy.cli recent --csv your_trades.csv --n-days 30 --starting-bankroll 200
 
 python -m polymarket_strategy.cli paper --calibration-csv your_trades.csv --once
 python -m polymarket_strategy.cli live  --calibration-csv your_trades.csv --once   # refuses without the triple opt-in
@@ -222,7 +231,29 @@ max_drawdown=8.31% skipped_by_risk_manager=10 ending_bankroll=$472.53
 ```
 
 92.6%, not 99.3% — and that's on data engineered to contain a real, if
-modest, edge. The control test
+modest, edge.
+
+### "Would this have made money in the last 30 days with $200?" — same caveat applies
+
+`run_last_n_days_backtest` / `cli.py recent` answers exactly that question,
+but **only for whatever CSV you point it at**. On 90 days of the same
+labeled synthetic data (calibration fit on the first 60 days only, traded
+against the last 30):
+
+```
+[last 30 days] candidates=2628 taken=2295 wins=2143 losses=152
+win_rate=93.38% avg_return_per_trade=4.86% total_pnl=$446.03 roi=223.02%
+max_drawdown=12.78% skipped_by_risk_manager=145
+starting_bankroll=$200.00 ending_bankroll=$646.03
+```
+
+Again: **synthetic, labeled, illustrative** — not a claim about the last 30
+real days on Polymarket, which this session cannot fetch (see above). Run
+`python scripts/fetch_polymarket_data.py --category tennis` yourself, then
+`cli.py recent --csv your_trades.csv --n-days 30 --starting-bankroll 200`
+for the real answer.
+
+The control test
 (`test_walk_forward_stays_at_zero_trades_with_exactly_calibrated_market`)
 uses a **deterministic** (no RNG) dataset where every bucket's empirical win
 rate equals its implied probability exactly, by construction, and asserts
@@ -241,7 +272,7 @@ polymarket_strategy/
   ev.py            — formula 2: expected value
   kelly.py         — formula 3: Kelly position sizing
   strategy.py      — combines the three into a signal
-  backtest.py       — single-split AND walk-forward (expanding window) backtest engines
+  backtest.py       — single-split, walk-forward, AND last-N-days backtest engines
   risk_manager.py   — daily loss cap, loss-streak cooldown, hard stake cap
   executor.py       — PaperBroker (default) / LiveBroker (triple opt-in, py-clob-client)
   live_loop.py      — polls open markets, applies a pre-fit curve, routes through risk + broker

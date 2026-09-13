@@ -3,7 +3,15 @@ from .ev import expected_value
 from .kelly import kelly_fraction
 from .strategy import Signal, StrategyConfig, generate_signals
 from .risk_manager import RiskDecision, RiskLimits, RiskManager
-from .backtest import BacktestReport, FoldReport, WalkForwardReport, run_backtest, run_walk_forward_backtest
+from .backtest import (
+    BacktestReport,
+    FoldReport,
+    RecentPeriodReport,
+    WalkForwardReport,
+    run_backtest,
+    run_last_n_days_backtest,
+    run_walk_forward_backtest,
+)
 
 __all__ = [
     "PriceBucket",
@@ -19,7 +27,9 @@ __all__ = [
     "RiskManager",
     "BacktestReport",
     "FoldReport",
+    "RecentPeriodReport",
     "WalkForwardReport",
     "run_backtest",
+    "run_last_n_days_backtest",
     "run_walk_forward_backtest",
 ]

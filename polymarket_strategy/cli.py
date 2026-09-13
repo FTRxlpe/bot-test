@@ -3,6 +3,8 @@
 
   backtest       single train/test split (see polymarket_strategy.backtest.run_backtest)
   walk-forward   multi-fold expanding-window backtest with the risk manager wired in
+  recent         "if I'd started trading N days ago" simulation on real CSV history
+                 (requires timestamps; --csv is mandatory, no synthetic fallback)
   paper          poll live Polymarket markets and paper-trade (no real orders, default)
   live           poll live Polymarket markets and place REAL orders -- requires
                  --live plus POLYMARKET_LIVE_TRADING=true plus POLYMARKET_PRIVATE_KEY
@@ -18,7 +20,7 @@ import argparse
 import sys
 import time
 
-from .backtest import run_backtest, run_walk_forward_backtest
+from .backtest import run_backtest, run_last_n_days_backtest, run_walk_forward_backtest
 from .data import generate_synthetic_trades, load_trades_csv
 from .executor import LiveTradingNotConfirmed, make_broker
 from .pricing import calibration_curve
@@ -109,6 +111,48 @@ def cmd_walk_forward(args) -> None:
         print("\nNo trades were taken across any fold -- no priced edge cleared min_delta out-of-sample.")
 
 
+def cmd_recent(args) -> None:
+    trades = load_trades_csv(args.csv)
+    config = _strategy_config_from_args(args)
+    risk_limits = _risk_limits_from_args(args)
+
+    try:
+        report = run_last_n_days_backtest(
+            trades,
+            n_days=args.n_days,
+            config=config,
+            risk_limits=risk_limits,
+            starting_bankroll=args.starting_bankroll,
+        )
+    except ValueError as e:
+        print(f"Cannot run: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    import datetime as _dt
+
+    start_str = _dt.datetime.utcfromtimestamp(report.period_start).date().isoformat()
+    end_str = _dt.datetime.utcfromtimestamp(report.period_end).date().isoformat()
+
+    print(f"data source: {args.csv}")
+    print(f"period: last {args.n_days} days ({start_str} to {end_str})")
+    print(f"calibration fit on {report.train_size} trades strictly before {start_str} (never on the test window)")
+    print(
+        f"risk limits: daily_loss<={args.max_daily_loss_fraction:.0%} of starting bankroll, "
+        f"cooldown after {args.max_consecutive_losses} consecutive losses "
+        f"({args.cooldown_trades} candidate trades), hard stake cap {args.hard_max_stake_fraction:.1%}"
+    )
+    print()
+    print(report.summary())
+    if report.n_taken == 0:
+        print(f"\nNo trades were taken in the last {args.n_days} days -- no priced edge cleared min_delta.")
+    else:
+        verdict = "made money" if report.total_pnl > 0 else ("lost money" if report.total_pnl < 0 else "broke even")
+        print(
+            f"\nWith ${report.starting_bankroll:.2f} starting capital, this strategy would have {verdict}: "
+            f"${report.total_pnl:+.2f} ({report.roi:+.2%}) over the last {args.n_days} days on this dataset."
+        )
+
+
 def _load_calibration_buckets(args):
     trades = load_trades_csv(args.calibration_csv)
     return calibration_curve(
@@ -191,6 +235,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_strategy_args(p_wf)
     _add_risk_args(p_wf)
     p_wf.set_defaults(func=cmd_walk_forward)
+
+    p_recent = sub.add_parser("recent", help='"if I\'d started trading N days ago" simulation on real CSV history')
+    p_recent.add_argument("--csv", required=True, help="CSV of historical trades WITH real timestamps (required, no synthetic fallback)")
+    p_recent.add_argument("--n-days", type=int, default=30)
+    p_recent.add_argument("--starting-bankroll", type=float, default=200.0)
+    _add_strategy_args(p_recent)
+    _add_risk_args(p_recent)
+    p_recent.set_defaults(func=cmd_recent)
 
     for name, help_text, func in [
         ("paper", "poll live markets and paper-trade (default, no real orders)", cmd_paper),

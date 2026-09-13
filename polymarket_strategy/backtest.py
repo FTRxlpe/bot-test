@@ -222,6 +222,85 @@ def _day_key_for(t: Trade, trades_per_day: int) -> int:
     return t.index // max(1, trades_per_day)
 
 
+def _simulate_sequential(
+    test_trades: list[Trade],
+    buckets: list[PriceBucket],
+    config: StrategyConfig,
+    risk_manager: RiskManager,
+    bankroll: float,
+    peak: float,
+    max_drawdown: float,
+    trades_per_day: int,
+) -> tuple[list[TradeResult], float, float, float, int, int]:
+    """Trades one chronologically-ordered test period against a FIXED,
+    already-fit calibration curve, applying the risk manager to every
+    candidate in order. Shared by run_walk_forward_backtest (one call per
+    fold) and run_last_n_days_backtest (one call for the whole window) so
+    both use identical trade-execution logic.
+
+    Returns (results, bankroll, peak, max_drawdown, n_candidates, n_skipped_by_risk).
+    """
+    results: list[TradeResult] = []
+    n_candidates = 0
+    n_skipped = 0
+
+    for t in test_trades:
+        if not (config.min_price <= t.price <= config.max_price):
+            continue
+        n_candidates += 1
+
+        day_key = _day_key_for(t, trades_per_day)
+        decision = risk_manager.check(day_key)
+        if not decision.allowed:
+            n_skipped += 1
+            risk_manager.record_skip_during_cooldown()
+            continue
+
+        bucket = _bucket_for_price(buckets, t.price)
+        if bucket is None:
+            continue
+
+        calibrated_p = bucket.actual_win_rate
+        delta = mispricing(calibrated_p, t.price)
+        ev = expected_value(calibrated_p, t.price) - config.fee_rate
+        if not (delta >= config.min_delta and ev > 0):
+            continue
+
+        size_frac = kelly_fraction(calibrated_p, t.price, fraction=config.kelly_fraction_cap)
+        if size_frac <= 0:
+            continue
+
+        desired_stake = bankroll * size_frac
+        stake = risk_manager.cap_stake(desired_stake)
+        stake = max(0.0, min(stake, bankroll))
+        if stake <= 0:
+            continue
+
+        shares = stake / t.price
+        pnl = shares * (1.0 - t.price) if t.outcome == 1 else -stake
+
+        bankroll += pnl
+        peak = max(peak, bankroll)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - bankroll) / peak)
+
+        risk_manager.record_result(day_key, pnl)
+
+        results.append(
+            TradeResult(
+                price=t.price,
+                outcome=t.outcome,
+                calibrated_win_probability=calibrated_p,
+                delta=delta,
+                ev=ev,
+                stake=stake,
+                pnl=pnl,
+            )
+        )
+
+    return results, bankroll, peak, max_drawdown, n_candidates, n_skipped
+
+
 def run_walk_forward_backtest(
     trades: list[Trade],
     config: StrategyConfig | None = None,
@@ -275,70 +354,13 @@ def run_walk_forward_backtest(
             min_trades_per_bucket=min_trades_per_bucket,
         )
 
-        fold_candidates = 0
-        fold_taken = 0
-        fold_wins = 0
-        fold_skipped = 0
-
-        for t in test_chunk:
-            if not (config.min_price <= t.price <= config.max_price):
-                continue
-            fold_candidates += 1
-            total_candidates += 1
-
-            day_key = _day_key_for(t, trades_per_day)
-            decision = risk_manager.check(day_key)
-            if not decision.allowed:
-                fold_skipped += 1
-                total_skipped_by_risk += 1
-                risk_manager.record_skip_during_cooldown()
-                continue
-
-            bucket = _bucket_for_price(buckets, t.price)
-            if bucket is None:
-                continue
-
-            calibrated_p = bucket.actual_win_rate
-            delta = mispricing(calibrated_p, t.price)
-            ev = expected_value(calibrated_p, t.price) - config.fee_rate
-            if not (delta >= config.min_delta and ev > 0):
-                continue
-
-            size_frac = kelly_fraction(calibrated_p, t.price, fraction=config.kelly_fraction_cap)
-            if size_frac <= 0:
-                continue
-
-            desired_stake = bankroll * size_frac
-            stake = risk_manager.cap_stake(desired_stake)
-            stake = max(0.0, min(stake, bankroll))
-            if stake <= 0:
-                continue
-
-            shares = stake / t.price
-            pnl = shares * (1.0 - t.price) if t.outcome == 1 else -stake
-
-            bankroll += pnl
-            peak = max(peak, bankroll)
-            if peak > 0:
-                max_drawdown = max(max_drawdown, (peak - bankroll) / peak)
-
-            risk_manager.record_result(day_key, pnl)
-
-            fold_taken += 1
-            if t.outcome == 1:
-                fold_wins += 1
-
-            all_results.append(
-                TradeResult(
-                    price=t.price,
-                    outcome=t.outcome,
-                    calibrated_win_probability=calibrated_p,
-                    delta=delta,
-                    ev=ev,
-                    stake=stake,
-                    pnl=pnl,
-                )
-            )
+        fold_results, bankroll, peak, max_drawdown, fold_candidates, fold_skipped = _simulate_sequential(
+            test_chunk, buckets, config, risk_manager, bankroll, peak, max_drawdown, trades_per_day
+        )
+        total_candidates += fold_candidates
+        total_skipped_by_risk += fold_skipped
+        all_results.extend(fold_results)
+        fold_wins = sum(1 for r in fold_results if r.outcome == 1)
 
         fold_reports.append(
             FoldReport(
@@ -346,9 +368,9 @@ def run_walk_forward_backtest(
                 train_size=len(train_chunks),
                 test_size=len(test_chunk),
                 n_candidates=fold_candidates,
-                n_taken=fold_taken,
+                n_taken=len(fold_results),
                 n_wins=fold_wins,
-                n_losses=fold_taken - fold_wins,
+                n_losses=len(fold_results) - fold_wins,
                 n_skipped_by_risk_manager=fold_skipped,
             )
         )
@@ -376,4 +398,134 @@ def run_walk_forward_backtest(
         avg_return_per_trade=avg_return_per_trade,
         n_skipped_by_risk_manager=total_skipped_by_risk,
         trades=all_results,
+    )
+
+
+@dataclass
+class RecentPeriodReport:
+    """Result of simulating trading over only the most recent `n_days` of a
+    real trade history, calibrated exclusively on data strictly before that
+    window -- answers "if I'd started trading this strategy n_days ago with
+    only the data available at that point, what would have happened?"
+    """
+
+    n_days: int
+    period_start: float  # unix seconds
+    period_end: float
+    train_size: int
+    test_size: int
+    n_candidates: int
+    n_taken: int
+    n_wins: int
+    n_losses: int
+    win_rate: float
+    total_pnl: float
+    starting_bankroll: float
+    ending_bankroll: float
+    roi: float
+    max_drawdown: float
+    avg_return_per_trade: float
+    n_skipped_by_risk_manager: int
+    trades: list[TradeResult]
+
+    def summary(self) -> str:
+        return (
+            f"[last {self.n_days} days] "
+            f"candidates={self.n_candidates} taken={self.n_taken} "
+            f"wins={self.n_wins} losses={self.n_losses} "
+            f"win_rate={self.win_rate:.2%} "
+            f"avg_return_per_trade={self.avg_return_per_trade:.2%} "
+            f"total_pnl=${self.total_pnl:.2f} roi={self.roi:.2%} "
+            f"max_drawdown={self.max_drawdown:.2%} "
+            f"skipped_by_risk_manager={self.n_skipped_by_risk_manager} "
+            f"starting_bankroll=${self.starting_bankroll:.2f} "
+            f"ending_bankroll=${self.ending_bankroll:.2f}"
+        )
+
+
+def run_last_n_days_backtest(
+    trades: list[Trade],
+    n_days: int = 30,
+    config: StrategyConfig | None = None,
+    risk_limits: RiskLimits | None = None,
+    starting_bankroll: float = 200.0,
+    bucket_width: float = 0.05,
+    min_trades_per_bucket: int = 30,
+    trades_per_day: int = 50,
+    reference_time: float | None = None,
+) -> RecentPeriodReport:
+    """Simulates trading only the most recent `n_days` of real resolved-trade
+    history, with the calibration curve fit EXCLUSIVELY on everything
+    strictly before the cutoff -- the test window never leaks into its own
+    calibration, same no-lookahead guarantee as the walk-forward engine, just
+    windowed by calendar time instead of fold count.
+
+    Requires every trade to carry a real, nonzero timestamp (as written by
+    scripts/fetch_polymarket_data.py) -- a calendar-time question like "the
+    last 30 days" is meaningless on index-only/synthetic ordering, so this
+    raises rather than silently guessing at day boundaries from row order.
+    """
+    config = config or StrategyConfig()
+    risk_limits = risk_limits or RiskLimits()
+    if n_days <= 0:
+        raise ValueError("n_days must be positive")
+    if not trades:
+        raise ValueError("no trades provided")
+    if any(t.timestamp <= 0 for t in trades):
+        raise ValueError(
+            "run_last_n_days_backtest requires every trade to carry a real timestamp "
+            "(e.g. from fetch_polymarket_data.py's CSV output) -- synthetic or "
+            "index-only trades have no calendar time to window by"
+        )
+
+    ordered = sorted(trades, key=lambda t: t.timestamp)
+    end_time = reference_time if reference_time is not None else ordered[-1].timestamp
+    cutoff = end_time - n_days * 86400
+
+    train = [t for t in ordered if t.timestamp < cutoff]
+    test = [t for t in ordered if cutoff <= t.timestamp <= end_time]
+    if not train:
+        raise ValueError(
+            f"no trade history before the {n_days}-day cutoff to fit a calibration curve on -- "
+            "need data older than the test window"
+        )
+    if not test:
+        raise ValueError(f"no trades found in the last {n_days} days of this dataset")
+
+    buckets = calibration_curve(
+        [t.price for t in train],
+        [t.outcome for t in train],
+        bucket_width=bucket_width,
+        min_trades_per_bucket=min_trades_per_bucket,
+    )
+
+    risk_manager = RiskManager(risk_limits, starting_bankroll)
+    results, bankroll, peak, max_drawdown, n_candidates, n_skipped = _simulate_sequential(
+        test, buckets, config, risk_manager, starting_bankroll, starting_bankroll, 0.0, trades_per_day
+    )
+
+    n_wins = sum(1 for r in results if r.outcome == 1)
+    n_losses = len(results) - n_wins
+    total_pnl = bankroll - starting_bankroll
+    avg_return_per_trade = sum(r.pnl / r.stake for r in results) / len(results) if results else 0.0
+
+    return RecentPeriodReport(
+        n_days=n_days,
+        period_start=cutoff,
+        period_end=end_time,
+        train_size=len(train),
+        test_size=len(test),
+        n_candidates=n_candidates,
+        n_taken=len(results),
+        n_wins=n_wins,
+        n_losses=n_losses,
+        win_rate=(n_wins / len(results)) if results else 0.0,
+        total_pnl=total_pnl,
+        starting_bankroll=starting_bankroll,
+        ending_bankroll=bankroll,
+        roi=(total_pnl / starting_bankroll) if starting_bankroll else 0.0,
+        max_drawdown=max_drawdown,
+        avg_return_per_trade=avg_return_per_trade,
+        n_skipped_by_risk_manager=n_skipped,
+        trades=results,
     )
