@@ -26,6 +26,7 @@ class Trade:
     outcome: int  # 1 if resolved YES, 0 if resolved NO
     market_id: str = ""
     index: int = 0  # chronological order
+    timestamp: float = 0.0  # unix seconds; 0.0 means "unknown" (index-only ordering)
 
 
 def load_trades_csv(path: str) -> list[Trade]:
@@ -33,12 +34,14 @@ def load_trades_csv(path: str) -> list[Trade]:
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
+            timestamp = row.get("timestamp", "")
             trades.append(
                 Trade(
                     price=float(row["price"]),
                     outcome=int(row["outcome"]),
                     market_id=row.get("market_id", ""),
                     index=i,
+                    timestamp=float(timestamp) if timestamp else 0.0,
                 )
             )
     return trades

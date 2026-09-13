@@ -13,8 +13,15 @@ Requires network access to gamma-api.polymarket.com and clob.polymarket.com
 (this script does NOT work from a sandbox with those hosts blocked -- run it
 from an environment with normal internet access, e.g. a GitHub Codespace).
 
+By default this fetches ALL closed markets, most-traded first. Pass
+`--category tennis` to restrict to tennis markets specifically (matched
+against the market's tags/category/question text, case-insensitively, since
+Gamma API's server-side tag filter param has changed shape over time and
+client-side filtering is robust regardless of which one is live).
+
 Usage:
   python scripts/fetch_polymarket_data.py --out real_trades.csv --n-markets 300
+  python scripts/fetch_polymarket_data.py --out tennis_trades.csv --category tennis --n-markets 500
   python scripts/run_backtest.py --csv real_trades.csv
 """
 from __future__ import annotations
@@ -67,8 +74,33 @@ def _get_json(url: str, params: dict, retries: int = 3, timeout: int = 20):
     raise RuntimeError(f"failed to fetch {full_url}: {last_err}")
 
 
-def fetch_closed_markets(n_markets: int, min_end_date: str, batch_size: int = 100):
-    """Fetches recently-closed, volume-ordered markets.
+def _market_matches_category(market: dict, category: str) -> bool:
+    """Client-side category match against tags/category/question/slug text.
+    Done client-side (rather than trusting a single server-side tag param)
+    because Gamma API's tag-filter query parameter shape has changed over
+    time -- matching text we already have in hand is robust regardless of
+    which server-side param happens to be live when this runs.
+    """
+    needle = category.lower()
+    haystacks = [str(market.get("category", "")), str(market.get("question", "")), str(market.get("slug", ""))]
+    for tag in market.get("tags") or []:
+        if isinstance(tag, dict):
+            haystacks.append(str(tag.get("label", "")))
+            haystacks.append(str(tag.get("slug", "")))
+        else:
+            haystacks.append(str(tag))
+    return any(needle in h.lower() for h in haystacks)
+
+
+def fetch_closed_markets(
+    n_markets: int,
+    min_end_date: str,
+    batch_size: int = 100,
+    category: str | None = None,
+    max_scanned: int = 50000,
+):
+    """Fetches recently-closed, volume-ordered markets, optionally filtered
+    to a single category/sport (e.g. "tennis") matched client-side.
 
     Polymarket's central limit order book (the source of the CLOB
     prices-history endpoint) didn't exist for its earliest 2020/2021
@@ -79,7 +111,8 @@ def fetch_closed_markets(n_markets: int, min_end_date: str, batch_size: int = 10
     """
     markets = []
     offset = 0
-    while len(markets) < n_markets:
+    scanned = 0
+    while len(markets) < n_markets and scanned < max_scanned:
         try:
             page = _get_json(
                 GAMMA_URL,
@@ -88,7 +121,7 @@ def fetch_closed_markets(n_markets: int, min_end_date: str, batch_size: int = 10
                     "end_date_min": min_end_date,
                     "order": "volume",
                     "ascending": "false",
-                    "limit": min(batch_size, n_markets - len(markets)),
+                    "limit": batch_size,
                     "offset": offset,
                 },
             )
@@ -103,10 +136,20 @@ def fetch_closed_markets(n_markets: int, min_end_date: str, batch_size: int = 10
             raise
         if not page:
             break
-        markets.extend(page)
+        scanned += len(page)
         offset += len(page)
-        if len(page) < batch_size:
+        raw_page_len = len(page)
+        if category:
+            page = [m for m in page if _market_matches_category(m, category)]
+        markets.extend(page)
+        if raw_page_len < batch_size:
             break
+    if category and not markets:
+        print(
+            f"  No markets matched category={category!r} after scanning {scanned} closed markets. "
+            "Try a different keyword or raise --max-scanned.",
+            file=sys.stderr,
+        )
     return markets[:n_markets]
 
 
@@ -168,6 +211,20 @@ def main() -> None:
     parser.add_argument("--samples-per-market", type=int, default=20)
     parser.add_argument("--fidelity-minutes", type=int, default=60)
     parser.add_argument(
+        "--category",
+        default=None,
+        help='restrict to markets whose tags/category/question/slug contain this text '
+        '(case-insensitive), e.g. --category tennis',
+    )
+    parser.add_argument(
+        "--max-scanned",
+        type=int,
+        default=50000,
+        help="stop scanning closed markets after this many, even if --n-markets "
+        "hasn't been matched yet (relevant mainly with --category, where most "
+        "markets won't match)",
+    )
+    parser.add_argument(
         "--min-end-date",
         default=(datetime.date.today() - datetime.timedelta(days=730)).isoformat(),
         help="only fetch markets that closed after this date (YYYY-MM-DD) -- "
@@ -178,10 +235,17 @@ def main() -> None:
 
     print(
         f"Fetching up to {args.n_markets} closed markets from Gamma API "
-        f"(closed after {args.min_end_date}, most-traded first)...",
+        f"(closed after {args.min_end_date}, most-traded first"
+        + (f", category={args.category!r}" if args.category else "")
+        + ")...",
         file=sys.stderr,
     )
-    markets = fetch_closed_markets(args.n_markets, args.min_end_date)
+    markets = fetch_closed_markets(
+        args.n_markets,
+        args.min_end_date,
+        category=args.category,
+        max_scanned=args.max_scanned,
+    )
     print(f"Got {len(markets)} closed markets.", file=sys.stderr)
 
     rows_written = 0
@@ -190,7 +254,7 @@ def main() -> None:
     n_fetch_errors = 0
     with open(args.out, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["price", "outcome", "market_id"])
+        writer.writerow(["price", "outcome", "market_id", "timestamp"])
 
         for i, market in enumerate(markets):
             resolved = resolved_outcome_for_first_token(market)
@@ -227,8 +291,9 @@ def main() -> None:
             sampled = history[::step][: args.samples_per_market]
             for point in sampled:
                 price = float(point.get("p", 0))
+                ts = point.get("t", "")
                 if 0.0 < price < 1.0:
-                    writer.writerow([price, outcome, market_id])
+                    writer.writerow([price, outcome, market_id, ts])
                     rows_written += 1
 
             if (i + 1) % 25 == 0:
